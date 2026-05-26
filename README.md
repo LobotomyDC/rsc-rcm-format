@@ -11,3 +11,4 @@ The RCM format is designed to be optimized for the Sega Dreamcast, but should al
 Output models are named after their entries in a JAG/MEM archive.
 
 `rcm_viewer` is an OpenGL 1.1 RCM model viewer for Linux and Dreamcast. The Dreamcast build requires GLdc.
+This viewer also provides a readout of important stats for every model. Polygon/Vertex counts, submesh counts, UV coordinates,and model format Magic.
