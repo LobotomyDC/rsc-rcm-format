@@ -52,6 +52,22 @@
 #define UV_Q15_DIVISOR   32767
 #define RCM_FILE_ALIGN   32u
 
+#define RLM_PICK_SIZE    47
+#define RLM_PICK_COUNT   (RLM_PICK_SIZE * RLM_PICK_SIZE)
+#define RLM_PICK_BYTES   ((RLM_PICK_COUNT + 7) / 8)
+#define RLM1_HEADER_SIZE 32u
+#define RLM1_BLOCK_SIZE  (RLM1_HEADER_SIZE + RLM_PICK_BYTES + TILE_COUNT)
+
+#define RCL1_FLAG_HAS_RLM       (1u << 0)
+#define RCL1_RLM_RESERVED_MAGIC 0x314d4c52u /* 'RLM1' little-endian */
+
+#define RLM1_FLAGS_HAS_PICK_MASK  (1u << 0)
+#define RLM1_FLAGS_HAS_HEIGHTS    (1u << 1)
+#define RLM1_FLAGS_HAS_CONFIG     (1u << 2)
+#define RLM1_FLAGS_DAT_ONLY       (1u << 3)
+#define RLM1_FLAGS_HAS_DAT        (1u << 4)
+#define RLM1_FLAGS_HAS_HEI        (1u << 5)
+
 #define COLOUR_TRANSPARENT ((int16_t)0x7fff)
 #define RCM_SUBMESH_TEX_NONE 0xFFFFu
 
@@ -3189,16 +3205,94 @@ static int build_rcl1_mesh(const uint8_t h[TILE_COUNT], const uint8_t c[TILE_COU
     return 1;
 }
 
+
+static void rlm_write_u16le(uint8_t *b, size_t off, uint16_t v) {
+    b[off] = (uint8_t)(v & 0xffu);
+    b[off + 1] = (uint8_t)(v >> 8);
+}
+
+static void rlm_write_u32le(uint8_t *b, size_t off, uint32_t v) {
+    b[off] = (uint8_t)(v & 0xffu);
+    b[off + 1] = (uint8_t)((v >> 8) & 0xffu);
+    b[off + 2] = (uint8_t)((v >> 16) & 0xffu);
+    b[off + 3] = (uint8_t)((v >> 24) & 0xffu);
+}
+
+static void rlm_bitset_set(uint8_t *bits, int idx) {
+    bits[idx >> 3] |= (uint8_t)(1u << (idx & 7));
+}
+
+static int rlm_tile_is_pickable(int plane, int have_hei, int have_dat,
+                                const uint8_t decoration[TILE_COUNT],
+                                const uint8_t *trim_keep, int x, int y) {
+    const int idx = x * REGION_SIZE + y;
+    const uint8_t overlay = (have_dat && decoration) ? decoration[idx] : 0;
+    const uint8_t tile_type = tilecfg_type_from_overlay(overlay);
+
+    if (trim_keep && !trim_keep[idx]) return 0;
+    if (g_tilecfg.loaded && tile_type == RCL_HOLE_TILE_TYPE) return 0;
+    if (plane == 1 || plane == 2) return overlay != 0;
+    if (!have_hei && !have_dat) return 0;
+    return 1;
+}
+
+static void build_rlm1_block(uint8_t out[RLM1_BLOCK_SIZE], int plane, int sx, int sy,
+                             int have_hei, int have_dat,
+                             const uint8_t heights[TILE_COUNT],
+                             const uint8_t decoration[TILE_COUNT],
+                             const uint8_t *trim_keep) {
+    memset(out, 0, RLM1_BLOCK_SIZE);
+
+    uint8_t *pick = out + RLM1_HEADER_SIZE;
+    uint8_t *height_out = pick + RLM_PICK_BYTES;
+
+    for (int x = 0; x < RLM_PICK_SIZE; x++) {
+        for (int y = 0; y < RLM_PICK_SIZE; y++) {
+            const int pidx = x * RLM_PICK_SIZE + y;
+            if (rlm_tile_is_pickable(plane, have_hei, have_dat, decoration,
+                                     trim_keep, x, y)) {
+                rlm_bitset_set(pick, pidx);
+            }
+        }
+    }
+
+    if (heights) memcpy(height_out, heights, TILE_COUNT);
+
+    memcpy(out, "RLM1", 4);
+    rlm_write_u16le(out, 4, (uint16_t)RLM1_HEADER_SIZE);
+    rlm_write_u16le(out, 6, 1);
+    out[8] = (uint8_t)plane;
+    out[9] = (uint8_t)sx;
+    out[10] = (uint8_t)sy;
+    rlm_write_u16le(out, 12, RLM_PICK_SIZE);
+    rlm_write_u16le(out, 14, RLM_PICK_SIZE);
+    rlm_write_u16le(out, 16, REGION_SIZE);
+    rlm_write_u16le(out, 18, REGION_SIZE);
+
+    uint32_t flags = RLM1_FLAGS_HAS_PICK_MASK | RLM1_FLAGS_HAS_HEIGHTS;
+    if (g_tilecfg.loaded) flags |= RLM1_FLAGS_HAS_CONFIG;
+    if (!have_hei && have_dat) flags |= RLM1_FLAGS_DAT_ONLY;
+    if (have_dat) flags |= RLM1_FLAGS_HAS_DAT;
+    if (have_hei) flags |= RLM1_FLAGS_HAS_HEI;
+    rlm_write_u32le(out, 20, flags);
+    rlm_write_u32le(out, 24, RLM1_HEADER_SIZE);
+    rlm_write_u32le(out, 28, RLM1_HEADER_SIZE + RLM_PICK_BYTES);
+}
+
 /* -------------------- Write RCL1 file -------------------- */
 
-static int write_rcl1_file(const char *out_path, const mesh_out_t *mesh, int with_uv) {
+static int write_rcl1_file(const char *out_path, const mesh_out_t *mesh, int with_uv,
+                           int plane, int sx, int sy, int have_hei, int have_dat,
+                           const uint8_t heights[TILE_COUNT],
+                           const uint8_t decoration[TILE_COUNT],
+                           const uint8_t *trim_keep) {
     if (!out_path || !mesh || !mesh->vtx_bytes || !mesh->idx || !mesh->sub || mesh->sub_count == 0) return 0;
 
     rcm_header_t hdr;
     memset(&hdr, 0, sizeof(hdr));
     memcpy(hdr.magic, "RCL1", 4);
     hdr.version = 1;
-    hdr.flags = 0;
+    hdr.flags = RCL1_FLAG_HAS_RLM;
 
     hdr.vertex_count  = mesh->vtx_count;
     hdr.index_count   = mesh->idx_count;
@@ -3217,8 +3311,13 @@ static int write_rcl1_file(const char *out_path, const mesh_out_t *mesh, int wit
                                             RCM_FILE_ALIGN);
 
     const size_t idx_bytes = (size_t)hdr.index_count * sizeof(uint16_t);
-    const size_t end_off   = (size_t)hdr.index_off + idx_bytes;
+    const size_t rlm_off = align_up_sz((size_t)hdr.index_off + idx_bytes, RCM_FILE_ALIGN);
+    const size_t end_off = rlm_off + RLM1_BLOCK_SIZE;
     hdr.file_size = (uint32_t)align_up_sz(end_off, RCM_FILE_ALIGN);
+
+    hdr.reserved1[0] = RCL1_RLM_RESERVED_MAGIC;
+    hdr.reserved1[1] = (uint32_t)rlm_off;
+    hdr.reserved1[2] = (uint32_t)RLM1_BLOCK_SIZE;
 
     /* AABB stored in fixed units scaled by 100, same convention as your RCM headers */
     hdr.aabb_min[0] = (int16_t)lrintf(mesh->aabb_min[0] * VERTEX_SCALE_F);
@@ -3231,16 +3330,20 @@ static int write_rcl1_file(const char *out_path, const mesh_out_t *mesh, int wit
     uint8_t *blob = (uint8_t*)calloc(1, hdr.file_size);
     if (!blob) return 0;
 
+    uint8_t rlm[RLM1_BLOCK_SIZE];
+    build_rlm1_block(rlm, plane, sx, sy, have_hei, have_dat, heights,
+                     decoration, trim_keep);
+
     memcpy(blob, &hdr, sizeof(hdr));
     memcpy(blob + hdr.submesh_off, mesh->sub, (size_t)hdr.submesh_count * sizeof(rcm_submesh_t));
     memcpy(blob + hdr.vertex_off,  mesh->vtx_bytes, (size_t)hdr.vertex_count * hdr.vertex_stride);
     memcpy(blob + hdr.index_off,   mesh->idx, idx_bytes);
+    memcpy(blob + rlm_off, rlm, RLM1_BLOCK_SIZE);
 
     const int ok = write_entire_file(out_path, blob, hdr.file_size);
     free(blob);
     return ok;
 }
-
 
 /* -------------------- Main conversion loop -------------------- */
 
@@ -3497,7 +3600,7 @@ int main(int argc, char **argv) {
                 char out_path[512];
                 snprintf(out_path, sizeof(out_path), "%s/%s.rcm", out_dir, base);
 
-                if (!write_rcl1_file(out_path, &mesh, with_uv)) {
+                if (!write_rcl1_file(out_path, &mesh, with_uv, plane, x, y, he != NULL, de != NULL, heights, decoration, trim_keep_ptr)) {
                     fprintf(stderr, "warn: write failed %s\n", out_path);
                 } else {
                     converted++;
