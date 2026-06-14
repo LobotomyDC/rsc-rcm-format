@@ -1,6 +1,6 @@
 // rsc2rcw.c - RuneCast wall/roof converter (maps63 + land63 -> RCW1)
 //
-// First-pass static wall/roof baker for RuneCast.
+// Static wall/roof model generator for RuneCast.
 // Outputs one wall RCW1 and one roof RCW1 per original 48x48 map section:
 //   <out_dir>/walls/mPXXYY.rcm
 //   <out_dir>/roofs/mPXXYY.rcm
@@ -94,8 +94,7 @@ typedef struct gl_atlas_position {
     float top_v, bottom_v;
 } gl_atlas_position;
 
-// Copied from your src/gl/textures/model_textures.c (repomix).
-// This MUST match your in-game atlas layout for model_textures.
+// Copied from src/gl/textures/model_textures.c (rsc-c).
 static const gl_atlas_position gl_texture_atlas_positions[] = {
     {0.000000f, 0.125000f, 0.375000f, 0.500000f},
     {0.187500f, 0.250000f, 0.687500f, 0.750000f},
@@ -158,7 +157,7 @@ static void gl_offset_texture_uvs_atlas(gl_atlas_position tp, float *u, float *v
     float w = fabsf(tp.left_u - tp.right_u);
     float h = fabsf(tp.top_v  - tp.bottom_v);
 
-    // Fountain special-case (matches your code)
+    // Fountain special-case
     if ((w * 1024.0f) == 64.0f && (h * 1024.0f) == 128.0f) {
         h /= 2.0f;
     }
@@ -741,12 +740,6 @@ static int decode_dat_v63(const uint8_t *data, size_t len, chunk_data_t *out) {
      *   diagonal \        raw u8
      *   diagonal /         raw u8, stored as value + 12000 when non-zero
      *
-     * Only the roof stream and later tile fields are RLE-style. The previous
-     * prototype tried the older RLE wall layout first; it can appear to decode
-     * successfully against maps63 while shifting every following stream. That is
-     * exactly the kind of failure that produces incomplete fences/walls and bad
-     * diagonal-roof decisions. Prefer raw-walls decoding for v63 and keep RLE as
-     * a fallback only for older/nonstandard packs.
      */
     chunk_data_t raw = *out;
     const int ok_raw = decode_dat_v63_try_raw_walls(data, len, &raw);
@@ -837,7 +830,7 @@ static int nb_height_raw(const nb_data_t *nb, int x, int y) {
     const chunk_data_t *c = nb_chunk_const(nb, &lx, &ly);
     if (c && c->have_h) return (int)c->h[lx * REGION_SIZE + ly] * 3;
 
-    /* Conservative edge clamp fallback if a neighbor is missing. */
+    /*edge clamp fallback if a neighbor is missing. */
     if (x < 0) x = 0;
     if (y < 0) y = 0;
     if (x >= REGION_SIZE) x = REGION_SIZE - 1;
@@ -1402,7 +1395,7 @@ static int bake_roofs(mesh_t *m, const nb_data_t *nb, const config_db_t *cfg) {
         }
     }
 
-    /* First normalization pass mirrors world_load_section(). */
+    /* Normalization pass mirrors world_load_section() in rsc-c. */
     for (int x = 0; x < REGION_SIZE; ++x) {
         for (int y = 0; y < REGION_SIZE; ++y) {
             int roof_id = c->roofs[x * REGION_SIZE + y];
