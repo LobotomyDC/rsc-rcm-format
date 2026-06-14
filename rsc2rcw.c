@@ -26,6 +26,10 @@
 // - Wall geometry is neighbor-height aware at x/y == 48 so section edges align.
 // - Roof baking is included, but should be treated as a validation prototype. Roofs
 //   need neighbor roof/wall samples, so this file loads a 3x3 map neighborhood.
+// - Wall RCWs also carry an RWM1 side metadata block with baked base adjacency
+//   and packed tile directions. This is intentionally enough for RCM/RCW runtime
+//   traversal without keeping maps63.jag/mem resident, and deliberately excludes
+//   .loc scenery placement data.
 // - maps63.dat uses raw wall/diagonal wall streams when VERSION_MAPS > 53, matching
 //   RuneCast world_load_section_files(). Older RLE wall decoding is retained only as
 //   a fallback for non-v63 inputs.
@@ -60,6 +64,22 @@
 #define DIAG_NW_SE_OFFSET   12000u
 
 #define NPC_SPRITE_COUNT 12
+
+#define RCW1_FLAG_HAS_RWM       (1u << 0)
+#define RCW1_RWM_RESERVED_MAGIC 0x314d5752u /* 'RWM1' little-endian */
+
+#define RWM1_HEADER_SIZE 32u
+#define RWM1_DIR_BYTES   (TILE_COUNT / 2)
+#define RWM1_BLOCK_SIZE  (RWM1_HEADER_SIZE + TILE_COUNT + RWM1_DIR_BYTES)
+
+#define RWM1_FLAGS_HAS_ADJACENCY   (1u << 0)
+#define RWM1_FLAGS_HAS_DIRECTIONS  (1u << 1)
+#define RWM1_FLAGS_HAS_TILE_CONFIG (1u << 2)
+#define RWM1_FLAGS_HAS_DAT         (1u << 3)
+
+enum {
+    RCW_FLOOR_TILE_TYPE = 2
+};
 
 #if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
 #define STATIC_ASSERT(cond, msg) _Static_assert(cond, msg)
@@ -211,6 +231,18 @@ static uint32_t read_u32be(const uint8_t *b, size_t off, size_t len) {
     if (off + 4 > len) die("read_u32be out of range");
     return ((uint32_t)b[off] << 24) | ((uint32_t)b[off + 1] << 16) |
            ((uint32_t)b[off + 2] << 8) | (uint32_t)b[off + 3];
+}
+
+static void write_u16le(uint8_t *b, size_t off, uint16_t v) {
+    b[off + 0] = (uint8_t)(v & 0xffu);
+    b[off + 1] = (uint8_t)((v >> 8) & 0xffu);
+}
+
+static void write_u32le(uint8_t *b, size_t off, uint32_t v) {
+    b[off + 0] = (uint8_t)(v & 0xffu);
+    b[off + 1] = (uint8_t)((v >> 8) & 0xffu);
+    b[off + 2] = (uint8_t)((v >> 16) & 0xffu);
+    b[off + 3] = (uint8_t)((v >> 24) & 0xffu);
 }
 
 static int ensure_dir(const char *path) {
@@ -445,17 +477,25 @@ typedef struct roofcfg {
     int fill;
 } roofcfg_t;
 
+typedef struct tilecfg {
+    uint8_t type;
+    uint8_t blocking;
+} tilecfg_t;
+
 typedef struct config_db {
     wallcfg_t *walls;
     int wall_count;
     roofcfg_t *roofs;
     int roof_count;
+    tilecfg_t *tiles;
+    int tile_count;
 } config_db_t;
 
 static void config_free(config_db_t *cfg) {
     if (!cfg) return;
     free(cfg->walls);
     free(cfg->roofs);
+    free(cfg->tiles);
     memset(cfg, 0, sizeof(*cfg));
 }
 
@@ -556,9 +596,17 @@ static int config_load(const char *config_jag_path, config_db_t *out) {
     for (int i = 0; i < roof_count; i++) out->roofs[i].height = gd_u8(&r);
     for (int i = 0; i < roof_count; i++) out->roofs[i].fill = gd_u8(&r);
 
+    int tile_count = gd_u16(&r);
+    out->tile_count = tile_count;
+    out->tiles = (tilecfg_t *)xcalloc((size_t)tile_count, sizeof(tilecfg_t));
+    for (int i = 0; i < tile_count; i++) (void)gd_u32_fill(&r);
+    for (int i = 0; i < tile_count; i++) out->tiles[i].type = (uint8_t)gd_u8(&r);
+    for (int i = 0; i < tile_count; i++) out->tiles[i].blocking = (uint8_t)gd_u8(&r);
+
     free(str_dat);
     free(int_dat);
-    fprintf(stderr, "info: loaded %d wall configs, %d roof configs\n", wall_count, roof_count);
+    fprintf(stderr, "info: loaded %d wall configs, %d roof configs, %d tile configs\n",
+            wall_count, roof_count, tile_count);
     return 1;
 }
 
@@ -570,6 +618,8 @@ typedef struct chunk_data {
     uint8_t walls_ew[TILE_COUNT];
     uint16_t walls_diag[TILE_COUNT];
     uint8_t roofs[TILE_COUNT];
+    uint8_t tile_decoration[TILE_COUNT];
+    uint8_t tile_direction[TILE_COUNT];
     int have_h;
     int have_dat;
 } chunk_data_t;
@@ -638,6 +688,8 @@ static int decode_dat_v63_try_rle(const uint8_t *data, size_t len, chunk_data_t 
     memset(out->walls_ew, 0, TILE_COUNT);
     memset(out->walls_diag, 0, sizeof(out->walls_diag));
     memset(out->roofs, 0, TILE_COUNT);
+    memset(out->tile_decoration, 0, TILE_COUNT);
+    memset(out->tile_direction, 0, TILE_COUNT);
 
     if (!dat_rle0_decode_u8(data, len, &off, out->walls_ns)) return 0;
     if (!dat_rle0_decode_u8(data, len, &off, out->walls_ew)) return 0;
@@ -652,9 +704,8 @@ static int decode_dat_v63_try_rle(const uint8_t *data, size_t len, chunk_data_t 
 
     if (!dat_rle0_decode_u8(data, len, &off, out->roofs)) return 0;
 
-    /* tileDecoration and tileDirection are decoded/skipped to validate the layout. */
-    if (!dat_repeat_last_decode_u8(data, len, &off, NULL)) return 0;
-    if (!dat_rle0_decode_u8(data, len, &off, NULL)) return 0;
+    if (!dat_repeat_last_decode_u8(data, len, &off, out->tile_decoration)) return 0;
+    if (!dat_rle0_decode_u8(data, len, &off, out->tile_direction)) return 0;
     return 1;
 }
 
@@ -671,9 +722,11 @@ static int decode_dat_v63_try_raw_walls(const uint8_t *data, size_t len, chunk_d
     for (int i = 0; i < TILE_COUNT; i++) if (diag2[i]) out->walls_diag[i] = (uint16_t)(diag2[i] + DIAG_NW_SE_OFFSET);
 
     memset(out->roofs, 0, TILE_COUNT);
+    memset(out->tile_decoration, 0, TILE_COUNT);
+    memset(out->tile_direction, 0, TILE_COUNT);
     if (!dat_rle0_decode_u8(data, len, &off, out->roofs)) return 0;
-    if (!dat_repeat_last_decode_u8(data, len, &off, NULL)) return 0;
-    if (!dat_rle0_decode_u8(data, len, &off, NULL)) return 0;
+    if (!dat_repeat_last_decode_u8(data, len, &off, out->tile_decoration)) return 0;
+    if (!dat_rle0_decode_u8(data, len, &off, out->tile_direction)) return 0;
     return 1;
 }
 
@@ -702,6 +755,8 @@ static int decode_dat_v63(const uint8_t *data, size_t len, chunk_data_t *out) {
         memcpy(out->walls_ew, raw.walls_ew, TILE_COUNT);
         memcpy(out->walls_diag, raw.walls_diag, sizeof(out->walls_diag));
         memcpy(out->roofs, raw.roofs, TILE_COUNT);
+        memcpy(out->tile_decoration, raw.tile_decoration, TILE_COUNT);
+        memcpy(out->tile_direction, raw.tile_direction, TILE_COUNT);
         return 1;
     }
 
@@ -712,6 +767,8 @@ static int decode_dat_v63(const uint8_t *data, size_t len, chunk_data_t *out) {
         memcpy(out->walls_ew, rle.walls_ew, TILE_COUNT);
         memcpy(out->walls_diag, rle.walls_diag, sizeof(out->walls_diag));
         memcpy(out->roofs, rle.roofs, TILE_COUNT);
+        memcpy(out->tile_decoration, rle.tile_decoration, TILE_COUNT);
+        memcpy(out->tile_direction, rle.tile_direction, TILE_COUNT);
         return 1;
     }
 
@@ -802,6 +859,50 @@ static int nb_diag_raw(const nb_data_t *nb, int x, int y) {
     const chunk_data_t *c = nb_chunk_const(nb, &lx, &ly);
     if (!c || !c->have_dat) return 0;
     return (int)c->walls_diag[lx * REGION_SIZE + ly];
+}
+
+static int nb_wall_ew_raw(const nb_data_t *nb, int x, int y) {
+    int lx = x, ly = y;
+    const chunk_data_t *c = nb_chunk_const(nb, &lx, &ly);
+    if (!c || !c->have_dat) return 0;
+    return (int)c->walls_ew[lx * REGION_SIZE + ly];
+}
+
+static int nb_wall_ns_raw(const nb_data_t *nb, int x, int y) {
+    int lx = x, ly = y;
+    const chunk_data_t *c = nb_chunk_const(nb, &lx, &ly);
+    if (!c || !c->have_dat) return 0;
+    return (int)c->walls_ns[lx * REGION_SIZE + ly];
+}
+
+static int nb_tile_decoration_raw(const nb_data_t *nb, int x, int y) {
+    int lx = x, ly = y;
+    const chunk_data_t *c = nb_chunk_const(nb, &lx, &ly);
+    if (!c || !c->have_dat) return 0;
+    return (int)c->tile_decoration[lx * REGION_SIZE + ly];
+}
+
+static int nb_tile_direction_raw(const nb_data_t *nb, int x, int y) {
+    int lx = x, ly = y;
+    const chunk_data_t *c = nb_chunk_const(nb, &lx, &ly);
+    if (!c || !c->have_dat) return 0;
+    return (int)c->tile_direction[lx * REGION_SIZE + ly];
+}
+
+static int wall_blocks_route(const config_db_t *cfg, int wall_id) {
+    if (!cfg || wall_id < 0 || wall_id >= cfg->wall_count) return 0;
+    const wallcfg_t *w = &cfg->walls[wall_id];
+    return w->interactive == 0 && w->blocking != 0;
+}
+
+static int tile_blocks_route(const config_db_t *cfg, int decoration) {
+    if (!cfg || decoration <= 0 || decoration - 1 >= cfg->tile_count) return 0;
+    return cfg->tiles[decoration - 1].blocking != 0;
+}
+
+static int tile_is_floor(const config_db_t *cfg, int decoration) {
+    if (!cfg || decoration <= 0 || decoration - 1 >= cfg->tile_count) return 0;
+    return cfg->tiles[decoration - 1].type == RCW_FLOOR_TILE_TYPE;
 }
 
 static int has_roof_full(const nb_data_t *nb, int x, int y) {
@@ -1420,7 +1521,73 @@ static int bake_roofs(mesh_t *m, const nb_data_t *nb, const config_db_t *cfg) {
     return m->idx_count > 0;
 }
 
-static int write_rcw1_file(const char *path, const mesh_t *m, int allow_empty) {
+static void build_rwm1_block(uint8_t out[RWM1_BLOCK_SIZE], const nb_data_t *nb,
+                             const config_db_t *cfg, int plane, int sx, int sy) {
+    memset(out, 0, RWM1_BLOCK_SIZE);
+
+    uint8_t *adj = out + RWM1_HEADER_SIZE;
+    uint8_t *dir = adj + TILE_COUNT;
+
+    for (int x = 0; x < REGION_SIZE; x++) {
+        for (int y = 0; y < REGION_SIZE; y++) {
+            const int idx = x * REGION_SIZE + y;
+            uint8_t a = 0;
+
+            const int decoration = nb_tile_decoration_raw(nb, x, y);
+            if (tile_blocks_route(cfg, decoration)) a |= 0x40u;
+            if (tile_is_floor(cfg, decoration)) a |= 0x80u;
+
+            int wall = nb_wall_ew_raw(nb, x, y);
+            if (wall > 0 && wall_blocks_route(cfg, wall - 1)) a |= 0x01u;
+
+            wall = nb_wall_ew_raw(nb, x, y + 1);
+            if (wall > 0 && wall_blocks_route(cfg, wall - 1)) a |= 0x04u;
+
+            wall = nb_wall_ns_raw(nb, x, y);
+            if (wall > 0 && wall_blocks_route(cfg, wall - 1)) a |= 0x02u;
+
+            wall = nb_wall_ns_raw(nb, x + 1, y);
+            if (wall > 0 && wall_blocks_route(cfg, wall - 1)) a |= 0x08u;
+
+            wall = nb_diag_raw(nb, x, y);
+            if (wall > 0 && wall < 12000 && wall_blocks_route(cfg, wall - 1)) {
+                a |= 0x20u;
+            } else if (wall > 12000 && wall < 24000 && wall_blocks_route(cfg, wall - 12001)) {
+                a |= 0x10u;
+            }
+
+            adj[idx] = a;
+
+            const uint8_t d = (uint8_t)(nb_tile_direction_raw(nb, x, y) & 0x0f);
+            if (idx & 1) {
+                dir[idx >> 1] |= (uint8_t)(d << 4);
+            } else {
+                dir[idx >> 1] |= d;
+            }
+        }
+    }
+
+    memcpy(out, "RWM1", 4);
+    write_u16le(out, 4, (uint16_t)RWM1_HEADER_SIZE);
+    write_u16le(out, 6, 1);
+    out[8] = (uint8_t)plane;
+    out[9] = (uint8_t)sx;
+    out[10] = (uint8_t)sy;
+    write_u16le(out, 12, REGION_SIZE);
+    write_u16le(out, 14, REGION_SIZE);
+
+    uint32_t flags = RWM1_FLAGS_HAS_ADJACENCY | RWM1_FLAGS_HAS_DIRECTIONS;
+    if (cfg && cfg->tile_count > 0) flags |= RWM1_FLAGS_HAS_TILE_CONFIG;
+    if (nb && nb->c[1][1].have_dat) flags |= RWM1_FLAGS_HAS_DAT;
+    write_u32le(out, 16, flags);
+    write_u32le(out, 20, RWM1_HEADER_SIZE);
+    write_u32le(out, 24, RWM1_HEADER_SIZE + TILE_COUNT);
+    write_u32le(out, 28, RWM1_BLOCK_SIZE);
+}
+
+static int write_rcw1_file(const char *path, const mesh_t *m, int allow_empty,
+                           const nb_data_t *rwm_nb, const config_db_t *rwm_cfg,
+                           int plane, int sx, int sy) {
     if (!m) return 0;
     if (!allow_empty && (m->v_count == 0 || m->idx_count == 0 || m->sub_count == 0)) return 0;
 
@@ -1428,6 +1595,8 @@ static int write_rcw1_file(const char *path, const mesh_t *m, int allow_empty) {
     memset(&hdr, 0, sizeof(hdr));
     memcpy(hdr.magic, "RCW1", 4);
     hdr.version = 1;
+    const int has_rwm = (rwm_nb && rwm_cfg);
+    if (has_rwm) hdr.flags |= RCW1_FLAG_HAS_RWM;
     hdr.vertex_count = m->v_count;
     hdr.index_count = m->idx_count;
     hdr.submesh_count = m->sub_count;
@@ -1439,7 +1608,15 @@ static int write_rcw1_file(const char *path, const mesh_t *m, int allow_empty) {
     hdr.vertex_off = (uint32_t)align_up_sz((size_t)hdr.submesh_off + (size_t)hdr.submesh_count * sizeof(rcm_submesh_t), RCM_FILE_ALIGN);
     hdr.index_off = (uint32_t)align_up_sz((size_t)hdr.vertex_off + (size_t)hdr.vertex_count * sizeof(rcm_vtxf_t), RCM_FILE_ALIGN);
     size_t idx_bytes = (size_t)hdr.index_count * sizeof(uint16_t);
-    hdr.file_size = (uint32_t)align_up_sz((size_t)hdr.index_off + idx_bytes, RCM_FILE_ALIGN);
+    const size_t mesh_end = (size_t)hdr.index_off + idx_bytes;
+    const size_t rwm_off = has_rwm ? align_up_sz(mesh_end, RCM_FILE_ALIGN) : 0u;
+    const size_t end_off = has_rwm ? (rwm_off + RWM1_BLOCK_SIZE) : mesh_end;
+    hdr.file_size = (uint32_t)align_up_sz(end_off, RCM_FILE_ALIGN);
+    if (has_rwm) {
+        hdr.reserved1[0] = RCW1_RWM_RESERVED_MAGIC;
+        hdr.reserved1[1] = (uint32_t)rwm_off;
+        hdr.reserved1[2] = (uint32_t)RWM1_BLOCK_SIZE;
+    }
 
     if (m->has_aabb) {
         hdr.aabb_min[0] = (int16_t)lrintf(m->aabb_min[0] * VERTEX_SCALE_F);
@@ -1455,6 +1632,11 @@ static int write_rcw1_file(const char *path, const mesh_t *m, int allow_empty) {
     if (hdr.submesh_count) memcpy(blob + hdr.submesh_off, m->sub, (size_t)hdr.submesh_count * sizeof(rcm_submesh_t));
     if (hdr.vertex_count) memcpy(blob + hdr.vertex_off, m->v, (size_t)hdr.vertex_count * sizeof(rcm_vtxf_t));
     if (hdr.index_count) memcpy(blob + hdr.index_off, m->idx, idx_bytes);
+    if (has_rwm) {
+        uint8_t rwm[RWM1_BLOCK_SIZE];
+        build_rwm1_block(rwm, rwm_nb, rwm_cfg, plane, sx, sy);
+        memcpy(blob + rwm_off, rwm, RWM1_BLOCK_SIZE);
+    }
 
     int ok = write_entire_file(path, blob, hdr.file_size);
     free(blob);
@@ -1467,7 +1649,7 @@ static void section_name(char out[32], int plane, int x, int y) {
 
 static void usage(const char *exe) {
     fprintf(stderr,
-        "Usage: %s land63.jag maps63.jag config63.jag out_dir [options]\n"
+        "Usage: %s land63.jag maps63.jag config85.jag out_dir [options]\n"
         "Options:\n"
         "  --land-mem <land63.mem>\n"
         "  --maps-mem <maps63.mem>\n"
@@ -1576,10 +1758,11 @@ int main(int argc, char **argv) {
                         fprintf(stderr, "warn: failed deduplicating wall mesh %s\n", base);
                         ok = 0;
                     }
-                    if (ok || empty_files) {
+                    if (ok || empty_files || nb.c[1][1].have_dat) {
                         char out_path[1200];
                         snprintf(out_path, sizeof(out_path), "%s/%s.rcm", walls_dir, base);
-                        if (!write_rcw1_file(out_path, &mesh, empty_files)) {
+                        if (!write_rcw1_file(out_path, &mesh, empty_files || nb.c[1][1].have_dat,
+                                             &nb, &cfg, plane, x, y)) {
                             fprintf(stderr, "warn: failed writing %s\n", out_path);
                         } else {
                             written_walls++;
@@ -1603,7 +1786,7 @@ int main(int argc, char **argv) {
                     if (ok || empty_files) {
                         char out_path[1200];
                         snprintf(out_path, sizeof(out_path), "%s/%s.rcm", roofs_dir, base);
-                        if (!write_rcw1_file(out_path, &mesh, empty_files)) {
+                        if (!write_rcw1_file(out_path, &mesh, empty_files, NULL, NULL, plane, x, y)) {
                             fprintf(stderr, "warn: failed writing %s\n", out_path);
                         } else {
                             written_roofs++;
