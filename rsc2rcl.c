@@ -1,5 +1,5 @@
 // rsc2rcl.c - RuneCast landscape converter (HEI/DAT -> RCL1)
-// Based on rsc2rcm.c utilities (JAG + bz2 handling) but outputs RCL1 meshes.
+// Based on the rsc2rcm.c utility (JAG + bz2 handling), but outputs RCL1 Landscape meshes.
 //
 // Build (Linux): gcc -std=c99 -O2 -Wall -Wextra rsc2rcl.c -lbz2 -lm -o rsc2rcl
 //
@@ -183,7 +183,7 @@ static int write_entire_file(const char *path, const void *data, size_t len) {
     return 1;
 }
 
-/* Same hash used by JAG directory lookup in RuneCast utility.c */
+/* Same hash used by JAG directory lookup in rsc-c's utility.c */
 static uint32_t rsc_hash_name(const char *name) {
     uint32_t hash = 0;
     for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
@@ -325,7 +325,7 @@ static uint8_t *jag_extract_entry(const jag_entry_t *e, size_t *out_len) {
  *   tiles[i].blocking
  *
  * This is parsed from config*.jag -> integer.dat + string.dat, using the same decode
- * rules as RuneCast's game-data.c.
+ * rules as rsc-c's game-data.c.
  */
 
 #define JAGEX_TRANSPARENT (12345678)
@@ -361,7 +361,7 @@ static int gd_u32_fill(gd_reader_t *r) {
             ((int)r->in[r->in_off + 3]);
     r->in_off += 4;
 
-    /* RuneCast behaviour: values > 99999999 encode signed colours. */
+    /* rsc-c behaviour: values > 99999999 encode signed colours. */
     if (v > 99999999) v = 99999999 - v;
     return v;
 }
@@ -418,7 +418,7 @@ static int tilecfg_load_from_config_jag(const char *config_jag_path) {
     r.str = str_dat; r.str_len = slen; r.str_off = 0;
     r.in  = int_dat; r.in_len  = ilen; r.in_off  = 0;
 
-    /* --- Mirror RuneCast's game_data_load_data() up to TileConfig --- */
+    /* --- Mirror rsc-c's game_data_load_data() up to TileConfig --- */
 
     int item_count = gd_u16(&r);
     for (int i = 0; i < item_count; i++) gd_skip_string(&r); /* name */
@@ -549,7 +549,7 @@ static int16_t tilecfg_fill_from_overlay(uint8_t overlay) {
 }
 
 
-/* -------------------- RCL1 output format (RCM-like) -------------------- */
+/* -------------------- RCL1 output format -------------------- */
 
 /*
  * Header and submesh layout identical to RCM (96-byte header, 16-byte submesh).
@@ -619,8 +619,8 @@ typedef struct gl_atlas_position {
     float top_v, bottom_v;
 } gl_atlas_position;
 
-// Copied from your src/gl/textures/model_textures.c (repomix).
-// This MUST match your in-game atlas layout for model_textures.
+// Copied from rsc-c's src/gl/textures/model_textures.c.
+// This MUST match the in-game atlas layout for model_textures.
 static const gl_atlas_position gl_texture_atlas_positions[] = {
     {0.000000f, 0.125000f, 0.375000f, 0.500000f},
     {0.187500f, 0.250000f, 0.687500f, 0.750000f},
@@ -683,7 +683,7 @@ static void gl_offset_texture_uvs_atlas(gl_atlas_position tp, float *u, float *v
     float w = fabsf(tp.left_u - tp.right_u);
     float h = fabsf(tp.top_v  - tp.bottom_v);
 
-    // Fountain special-case (matches your code)
+    // Fountain special-case (which probably isn't necessary here, oh well!)
     if ((w * 1024.0f) == 64.0f && (h * 1024.0f) == 128.0f) {
         h /= 2.0f;
     }
@@ -827,7 +827,7 @@ static int decode_hei(const uint8_t *data, size_t len, uint8_t out_h[TILE_COUNT]
     if (!data) return 0;
     size_t off = 0;
 
-    /* Heights: RLE then delta integrate, matching RuneCast world_load_section_files */
+    /* Heights: RLE then delta integrate, matching rsc-c's world_load_section_files */
     int last = 0;
     for (int t = 0; t < TILE_COUNT; ) {
         if (off >= len) return 0;
@@ -1115,7 +1115,7 @@ static int decode_dat_v63(const uint8_t *data, size_t len,
        tile-overlays.json in this pipeline defines ids 1..25 (0 = none).
 
        IMPORTANT (v63 / VERSION_MAPS > 53):
-       RuneCast reads the four wall fields (including both diagonal streams) as RAW bytes
+       rsc-c reads the four wall fields (including both diagonal streams) as RAW bytes
        (no RLE) for maps63. Older caches used RLE-zero runs for walls/diagonals.
        When both decoders appear plausible, prefer RAW unless it looks clearly wrong. */
     int bad_rle = 0, bad_raw = 0;
@@ -1677,7 +1677,7 @@ static inline int overlay_has_runtime_surface(uint8_t ov) {
 }
 
 static inline int overlay_is_hole(uint8_t ov) {
-    /* RuneCast's TileConfig is authoritative here.  Several overlays can be
+    /* rsc-c's TileConfig is authoritative here.  Several overlays can be
      * HOLE_TILE_TYPE; id 8 is the common transparent ladder/stair hole, but
      * DAT-only upper floors can use other HOLE ids as well.  Treat all hole
      * types as geometry cutouts, not black/grey quads. */
@@ -1703,7 +1703,7 @@ static uint16_t overlay_to_texture_id(uint8_t overlay) {
     if (overlay == 0) return RCM_SUBMESH_TEX_NONE;
     if ((d->flags & OVF_VALID) == 0) return RCM_SUBMESH_TEX_NONE;
 
-    /* Prefer RuneCast-accurate mapping if we have it. */
+    /* Prefer rsc-accurate mapping if we have it. */
     if (g_tilecfg.loaded) {
         const int16_t fill = tilecfg_fill_from_overlay(overlay);
 
@@ -1715,7 +1715,7 @@ static uint16_t overlay_to_texture_id(uint8_t overlay) {
         return RCM_SUBMESH_TEX_NONE;
     }
 
-    /* Fallback: legacy heuristic (what you had before). */
+    /* Fallback: legacy heuristic. */
     if ((d->flags & OVF_TEXTURED) == 0) return RCM_SUBMESH_TEX_NONE;
 
     const uint16_t tex = (uint16_t)(overlay - 1u);
@@ -2707,9 +2707,7 @@ static int build_rcl1_mesh(const uint8_t h[TILE_COUNT], const uint8_t c[TILE_COU
     if (trim_keep) merge_faces = 0;
 
     const uint32_t naive_vtx = (uint32_t)tile_w * (uint32_t)tile_h * 6u;
-
-    /* With per-tile UVs, a lot of vertices are not deduplicable across tile boundaries.
-       Size the pool conservatively for correctness (offline tool, a bit of extra memory is OK). */
+    
     const uint32_t base_expected_vtx = dedup
         ? (with_uv ? naive_vtx : ((uint32_t)REGION_SIZE * (uint32_t)REGION_SIZE))
         : naive_vtx;
@@ -3319,7 +3317,7 @@ static int write_rcl1_file(const char *out_path, const mesh_out_t *mesh, int wit
     hdr.reserved1[1] = (uint32_t)rlm_off;
     hdr.reserved1[2] = (uint32_t)RLM1_BLOCK_SIZE;
 
-    /* AABB stored in fixed units scaled by 100, same convention as your RCM headers */
+    /* AABB stored in fixed units scaled by 100, same convention as RCM headers */
     hdr.aabb_min[0] = (int16_t)lrintf(mesh->aabb_min[0] * VERTEX_SCALE_F);
     hdr.aabb_min[1] = (int16_t)lrintf(mesh->aabb_min[1] * VERTEX_SCALE_F);
     hdr.aabb_min[2] = (int16_t)lrintf(mesh->aabb_min[2] * VERTEX_SCALE_F);
