@@ -15,7 +15,7 @@ This viewer also provides a readout of important stats for every model. Polygon/
 
 ### RCM ### 
 
-RCM is the typical Scenery/Object/3D Ground Items model format. It is split into three types:
+RCM is the typical Scenery/Object/3D Ground Items model format, made to replace `models36.jag`. It is split into three types:
 
 RCM1: This type is for textured or partially-textured meshes. Vertices are stored as Floating-Point values.
 
